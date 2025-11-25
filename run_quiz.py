@@ -94,6 +94,13 @@ Examples:
         action='store_true',
         help='Force regenerate HTML templates from rubric'
     )
+
+    parser.add_argument(
+        '--browsers',
+        type=int,
+        default=1,
+        help='Number of headless browsers to use in parallel for PDF rendering'
+    )
     
     args = parser.parse_args()
     
@@ -134,7 +141,8 @@ Examples:
             skip_zip=args.no_zip,
             force_regenerate=args.regenerate,
             templates_only=args.templates_only,
-            generate_templates=not args.no_templates
+            generate_templates=not args.no_templates,
+            browsers=args.browsers
         ))
     except KeyboardInterrupt:
         print("\n\n⚠ Interrupted by user")

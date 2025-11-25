@@ -24,7 +24,7 @@ from .html_generator import (
     sanitize_filename,
     generate_blank_template_html
 )
-from .pdf_generator import generate_pdf
+from .pdf_generator import BrowserPool
 from .zip_creator import create_quiz_zip
 
 console = Console()
@@ -70,7 +70,7 @@ def load_or_generate_templates(config: dict, force_regenerate: bool = False) -> 
     return templates
 
 
-async def generate_blank_templates(config: dict, templates: Dict[str, str]) -> None:
+async def generate_blank_templates(config: dict, templates: Dict[str, str], browser_pool: BrowserPool) -> None:
     """Create Gradescope-ready blank HTML and PDF templates per question."""
     quiz_id = config['quiz_id']
     template_html_root = Path(f"output/quiz{quiz_id}/templates/html")
@@ -111,7 +111,7 @@ async def generate_blank_templates(config: dict, templates: Dict[str, str]) -> N
             f.write(blank_html)
 
         pdf_path = template_pdf_root / f"{group_id}_blank_template.pdf"
-        success = await generate_pdf(blank_html, str(pdf_path), str(html_path))
+        success = await browser_pool.generate_pdf(blank_html, str(pdf_path), str(html_path))
 
         if success:
             console.print(f"   [green]✓[/green] Blank PDF ready: {pdf_path}")
@@ -127,7 +127,8 @@ async def process_quiz(
     skip_zip: bool = False,
     force_regenerate: bool = False,
     templates_only: bool = False,
-    generate_templates: bool = True
+    generate_templates: bool = True,
+    browsers: int = 1
 ) -> None:
     """
     Main workflow: CSV → HTML → PDFs
@@ -141,6 +142,7 @@ async def process_quiz(
         force_regenerate: Force regeneration of templates
         templates_only: If True, only produce blank templates
         generate_templates: If False, skip blank template generation
+        browsers: Number of Playwright browser instances to use
     """
     quiz_id = config['quiz_id']
     quiz_name = config['quiz_name']
@@ -152,115 +154,80 @@ async def process_quiz(
     # Step 1: Load or generate templates
     templates = load_or_generate_templates(config, force_regenerate)
 
-    if generate_templates:
-        await generate_blank_templates(config, templates)
-    else:
-        console.print(f"[dim]⏭ Skipping blank template generation (--no-templates)[/dim]")
+    async with BrowserPool(max_browsers=browsers) as browser_pool:
+        if generate_templates:
+            await generate_blank_templates(config, templates, browser_pool)
+        else:
+            console.print(f"[dim]⏭ Skipping blank template generation (--no-templates)[/dim]")
 
-    if templates_only:
-        console.print(f"\n[dim]⏭ Templates-only mode: skipping student PDFs[/dim]")
-        return
-
-    if csv_path is None:
-        console.print("[red]✗[/red] CSV path is required to generate student files")
-        return
-
-    # Step 2: Parse CSV
-    console.print(f"\n[cyan]📊 Parsing CSV...[/cyan]")
-    parser = CanvasCSVParser(csv_path, config)
-    all_students = parser.get_student_data(limit=None)  # Get all students first
-    
-    # Filter by student name if provided
-    if student_name:
-        if limit:
-            console.print(f"   [yellow]⚠[/yellow] Note: --limit ignored when using --student filter")
-        search_name = student_name.lower().strip()
-        students = [
-            s for s in all_students 
-            if search_name in s['name'].lower()
-        ]
-        if not students:
-            console.print(f"\n[red]✗[/red] Error: No students found matching '{student_name}'")
-            console.print(f"   [dim]Available students: {', '.join([s['name'] for s in all_students[:10]])}...[/dim]")
+        if templates_only:
+            console.print(f"\n[dim]⏭ Templates-only mode: skipping student PDFs[/dim]")
             return
-        console.print(f"   [green]✓[/green] Found {len(students)} student(s) matching '{student_name}'")
-        if len(students) > 1:
-            console.print(f"   [yellow]⚠[/yellow] Multiple matches: {', '.join([s['name'] for s in students])}")
-    else:
-        students = all_students
-        if limit:
-            students = students[:limit]
-            console.print(f"   [yellow]⚠ Limited to {limit} students for testing[/yellow]")
-    
-    # Copy images to output folder for each question group
-    console.print(f"\n[cyan]📁 Setting up output directories...[/cyan]")
-    for group in config['question_groups']:
-        group_id = group['id']
-        group_name = group['name']
-        base_dir = f"output/quiz{quiz_id}/{group_id}_{group_name.lower().replace(' ', '_')}"
-        
-        # Copy images from templates to output
-        template_images = Path(f"templates/quiz{quiz_id}/images")
-        output_images = Path(f"{base_dir}/html/images")
-        
-        if template_images.exists():
-            if output_images.exists():
-                shutil.rmtree(output_images)
-            shutil.copytree(template_images, output_images)
-            console.print(f"   [green]✓[/green] Copied images to {base_dir}/html/images/")
-    
-    # Step 3: Generate PDFs for each student with progress bar
-    total_pdfs = len(students) * len(config['question_groups'])
-    console.print(f"\n[cyan]📄 Generating {total_pdfs} PDFs[/cyan] [dim]({len(students)} students × {len(config['question_groups'])} questions)[/dim]")
-    
-    pdf_count = 0
-    student_times = []
-    import time
-    overall_start = time.time()
-    
-    # Create progress bar
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("•"),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeElapsedColumn(),
-        console=console,
-    )
-    
-    with Live(progress, console=console, refresh_per_second=4):
-        task_id = progress.add_task(
-            "[cyan]Processing students...",
-            total=len(students)
+
+        if csv_path is None:
+            console.print("[red]✗[/red] CSV path is required to generate student files")
+            return
+
+        # Step 2: Parse CSV
+        console.print(f"\n[cyan]📊 Parsing CSV...[/cyan]")
+        parser = CanvasCSVParser(csv_path, config)
+        all_students = parser.get_student_data(limit=None)  # Get all students first
+
+        # Filter by student name if provided
+        if student_name:
+            if limit:
+                console.print(f"   [yellow]⚠[/yellow] Note: --limit ignored when using --student filter")
+            search_name = student_name.lower().strip()
+            students = [
+                s for s in all_students
+                if search_name in s['name'].lower()
+            ]
+            if not students:
+                console.print(f"\n[red]✗[/red] Error: No students found matching '{student_name}'")
+                console.print(f"   [dim]Available students: {', '.join([s['name'] for s in all_students[:10]])}...[/dim]")
+                return
+            console.print(f"   [green]✓[/green] Found {len(students)} student(s) matching '{student_name}'")
+            if len(students) > 1:
+                console.print(f"   [yellow]⚠[/yellow] Multiple matches: {', '.join([s['name'] for s in students])}")
+        else:
+            students = all_students
+            if limit:
+                students = students[:limit]
+                console.print(f"   [yellow]⚠ Limited to {limit} students for testing[/yellow]")
+
+        # Copy images to output folder for each question group
+        console.print(f"\n[cyan]📁 Setting up output directories...[/cyan]")
+        for group in config['question_groups']:
+            group_id = group['id']
+            group_name = group['name']
+            base_dir = f"output/quiz{quiz_id}/{group_id}_{group_name.lower().replace(' ', '_')}"
+
+            # Copy images from templates to output
+            template_images = Path(f"templates/quiz{quiz_id}/images")
+            output_images = Path(f"{base_dir}/html/images")
+
+            if template_images.exists():
+                if output_images.exists():
+                    shutil.rmtree(output_images)
+                shutil.copytree(template_images, output_images)
+                console.print(f"   [green]✓[/green] Copied images to {base_dir}/html/images/")
+
+        # Step 3: Generate PDFs for each student with progress bar
+        total_pdfs = len(students) * len(config['question_groups'])
+        console.print(
+            f"\n[cyan]📄 Generating {total_pdfs} PDFs[/cyan] [dim]({len(students)} students × {len(config['question_groups'])} questions)[/dim]"
         )
-        
-        for student_idx, student in enumerate(students, 1):
-            student_start = time.time()
-            
-            # Calculate running average and estimate
-            if student_times:
-                avg_time = sum(student_times) / len(student_times)
-                remaining_students = len(students) - len(student_times)
-                est_remaining = remaining_students * avg_time
-                
-                desc = f"[cyan]Processing: {student['name']}[/cyan]\n[dim]  Avg: {avg_time:.1f}s/student"
-                if est_remaining >= 60:
-                    desc += f" • Est: {est_remaining/60:.0f}m {est_remaining%60:.0f}s remaining"
-                else:
-                    desc += f" • Est: {est_remaining:.0f}s remaining"
-                desc += "[/dim]"
-            else:
-                desc = f"[cyan]Processing: {student['name']}[/cyan]"
-            
-            progress.update(task_id, description=desc)
-            
+        console.print(f"[dim]Using {browsers} browser(s) in the pool[/dim]")
+
+        import time
+        overall_start = time.time()
+
+        jobs = []
+        for student in students:
             for group in config['question_groups']:
                 group_id = group['id']
                 group_name = group['name']
-                
-                # Generate HTML for this student + question
+
                 page_break_mode = group.get('page_break', 'same-page')
                 num_parts = group.get('num_parts')
                 html = generate_student_html(
@@ -270,61 +237,70 @@ async def process_quiz(
                     page_break_mode=page_break_mode,
                     num_parts=num_parts
                 )
-                
-                # Create output paths
+
                 safe_name = sanitize_filename(student['name'])
                 variant = student[group_id]['variant']
-                    
+
                 base_dir = f"output/quiz{quiz_id}/{group_id}_{group_name.lower().replace(' ', '_')}"
                 html_dir = f"{base_dir}/html"
                 pdf_dir = f"{base_dir}/pdf"
-                
+
                 variant_filename = f"{group_id}v{variant}_nf_{safe_name}"
                 html_path = f"{html_dir}/{variant_filename}.html"
                 pdf_path = f"{pdf_dir}/{variant_filename}.pdf"
-                
-                # Save HTML file
+
                 Path(html_dir).mkdir(parents=True, exist_ok=True)
                 with open(html_path, 'w', encoding='utf-8') as f:
                     f.write(html)
-                
-                # Render to PDF
-                success = await generate_pdf(html, pdf_path, html_path)
-                
-                if success:
-                    pdf_count += 1
-            
-            # Track timing
-            student_elapsed = time.time() - student_start
-            student_times.append(student_elapsed)
-            
-            # Update progress
+
+                jobs.append((html, pdf_path, html_path))
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("•"),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+        )
+
+        pdf_count = 0
+
+        async def render_job(html_content: str, pdf_path: str, html_path: str):
+            result = await browser_pool.generate_pdf(html_content, pdf_path, html_path)
             progress.update(task_id, advance=1)
-    
-    # Summary with timing statistics
-    console.print()
-    total_time = time.time() - overall_start
-    avg_time = sum(student_times) / len(student_times) if student_times else 0
-    min_time = min(student_times) if student_times else 0
-    max_time = max(student_times) if student_times else 0
-    
-    summary_text = f"""[bold cyan]Summary:[/bold cyan]
+            return result
+
+        with Live(progress, console=console, refresh_per_second=4):
+            task_id = progress.add_task(
+                "[cyan]Rendering PDFs...",
+                total=len(jobs)
+            )
+
+            tasks = [asyncio.create_task(render_job(*job)) for job in jobs]
+            for task in asyncio.as_completed(tasks):
+                if await task:
+                    pdf_count += 1
+
+        total_time = time.time() - overall_start
+
+        summary_text = f"""[bold cyan]Summary:[/bold cyan]
   PDFs generated: [green]{pdf_count}[/green]/[cyan]{total_pdfs}[/cyan]
   Output directory: [yellow]output/quiz{quiz_id}/[/yellow]
-  
+
   [bold cyan]Timing:[/bold cyan]
   Total: [green]{total_time:.1f}s[/green] ({total_time/60:.1f}m)
-  Avg per student: [green]{avg_time:.1f}s[/green]
-  Range: [green]{min_time:.1f}s[/green] - [yellow]{max_time:.1f}s[/yellow]
-  
+
   [dim]├── {config['question_groups'][0]['id']}_{config['question_groups'][0]['name'].lower().replace(' ', '_')}/[/dim]
   [dim]│   ├── html/ ({len(students)} files)[/dim]
   [dim]│   └── pdf/ ({len(students)} files)[/dim]
   [dim]└── {config['question_groups'][1]['id']}_{config['question_groups'][1]['name'].lower().replace(' ', '_')}/[/dim]
   [dim]    ├── html/ ({len(students)} files)[/dim]
   [dim]    └── pdf/ ({len(students)} files)[/dim]"""
-    
-    console.print(Panel(summary_text, border_style="green", padding=(1, 2)))
+
+        console.print(Panel(summary_text, border_style="green", padding=(1, 2)))
     
     # Create zip file automatically (unless skipped)
     if not skip_zip:
